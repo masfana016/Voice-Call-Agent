@@ -245,5 +245,6 @@ if __name__ == "__main__":
         raise Exception("PUBLIC_BASE_URL not set in .env (your ngrok https URL, no trailing slash)")
 
     app = create_app()
-    print(f"Starting server on port 5000. Public URL: {PUBLIC_BASE_URL}")
-    web.run_app(app, host="0.0.0.0", port=5000)
+    port = int(os.getenv("PORT", 8080))
+    print(f"Starting server on port {port}. Public URL: {PUBLIC_BASE_URL}")
+    web.run_app(app, host="0.0.0.0", port=port)
