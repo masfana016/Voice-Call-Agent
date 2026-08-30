@@ -1,3 +1,0 @@
-App ID=1791311358133016
-App secret=0539d83a47dd76a38db8f67679bc232f
-FB_VERIFY_TOKEN=masfaansaeisecret123
