@@ -9,7 +9,6 @@ from aiohttp import web, WSMsgType
 import websockets
 from twilio.rest import Client
 
-from agent_think import agent_think_handler
 from pharmacy_functions import FUNCTION_MAP
 
 load_dotenv()
@@ -66,15 +65,21 @@ def sts_connect():
 # =========================================================
 
 def load_config():
+
     with open("config.json", "r") as f:
         config = json.load(f)
 
-    agent_think_secret = os.getenv("AGENT_THINK_SECRET", "")
-    config["agent"]["think"]["endpoint"]["headers"]["authorization"] = f"Bearer {agent_think_secret}"
+    google_api_key = os.getenv("GOOGLE_API_KEY")
 
-    config["agent"]["think"]["endpoint"]["url"] = f"{PUBLIC_BASE_URL}/agent-think"
+    if not google_api_key:
+        raise Exception("GOOGLE_API_KEY not found in .env")
+
+    config["agent"]["think"]["endpoint"]["headers"]["authorization"] = (
+        f"Bearer {google_api_key}"
+    )
 
     return config
+
 
 # =========================================================
 # BARGE-IN
@@ -847,11 +852,6 @@ def create_app():
     app.router.add_post(
         "/fb-webhook",
         fb_webhook_receive
-    )
-
-    app.router.add_post(
-        "/agent-think",
-        agent_think_handler
     )
 
     return app
