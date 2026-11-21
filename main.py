@@ -1,898 +1,491 @@
 import asyncio
 import base64
+import hashlib
+import hmac
 import json
 import os
+import re
+from xml.sax.saxutils import quoteattr
 
-import requests
-from dotenv import load_dotenv
-from aiohttp import web, WSMsgType
+import aiohttp
 import websockets
-from twilio.rest import Client
-
-from pharmacy_functions import FUNCTION_MAP
+from aiohttp import WSMsgType, web
+from dotenv import load_dotenv
+from twilio.request_validator import RequestValidator
+from twilio.rest import Client as TwilioClient
 
 load_dotenv()
 
+from solar_functions import (  # noqa: E402
+    FUNCTION_MAP,
+    TZ_NAME,
+    answers_text,
+    create_lead,
+    delete_lead,
+    get_lead,
+    init_db,
+    is_do_not_call,
+    today_text,
+)
 
 # =========================================================
 # CONFIG
 # =========================================================
 
+PUBLIC_BASE_URL = (os.getenv("PUBLIC_BASE_URL") or "").rstrip("/")
 TWILIO_ACCOUNT_SID = os.getenv("TWILIO_ACCOUNT_SID")
 TWILIO_AUTH_TOKEN = os.getenv("TWILIO_AUTH_TOKEN")
-TWILIO_FROM_NUMBER = os.getenv("TWILIO_FROM_NUMBER")
+TWILIO_PHONE_NUMBER = os.getenv("TWILIO_PHONE_NUMBER")
+LEADS_API_KEY = os.getenv("LEADS_API_KEY")
+COMPANY_NAME = os.getenv("COMPANY_NAME", "Your Solar Company")
+AGENT_NAME = os.getenv("AGENT_NAME", "Sara")
 
-PUBLIC_BASE_URL = os.getenv("PUBLIC_BASE_URL")
-
-# Facebook
+# Facebook Lead Ads (optional: the webhook is switched on only if all three are set)
 FB_VERIFY_TOKEN = os.getenv("FB_VERIFY_TOKEN")
 FB_PAGE_ACCESS_TOKEN = os.getenv("FB_PAGE_ACCESS_TOKEN")
+FB_APP_SECRET = os.getenv("FB_APP_SECRET")
+FB_GRAPH_VERSION = os.getenv("FB_GRAPH_VERSION", "v26.0")
+FB_ENABLED = all([FB_VERIFY_TOKEN, FB_PAGE_ACCESS_TOKEN, FB_APP_SECRET])
 
-# Secure /make-call endpoint
-MAKE_CALL_SECRET = os.getenv("MAKE_CALL_SECRET")
+# For numbers that arrive without a + sign, e.g. 92 for Pakistan. Leave empty if unsure.
+DEFAULT_COUNTRY_CODE = (os.getenv("DEFAULT_COUNTRY_CODE") or "").lstrip("+")
+
+for _name, _value in {
+    "PUBLIC_BASE_URL": PUBLIC_BASE_URL,
+    "TWILIO_ACCOUNT_SID": TWILIO_ACCOUNT_SID,
+    "TWILIO_AUTH_TOKEN": TWILIO_AUTH_TOKEN,
+    "TWILIO_PHONE_NUMBER": TWILIO_PHONE_NUMBER,
+    "LEADS_API_KEY": LEADS_API_KEY,
+    "DEEPGRAM_API_KEY": os.getenv("DEEPGRAM_API_KEY"),
+}.items():
+    if not _value:
+        raise RuntimeError(f"{_name} is not set in .env")
+if not PUBLIC_BASE_URL.startswith("https://"):
+    raise RuntimeError("PUBLIC_BASE_URL must use HTTPS")
+
+validator = RequestValidator(TWILIO_AUTH_TOKEN)
+twilio_client = TwilioClient(TWILIO_ACCOUNT_SID, TWILIO_AUTH_TOKEN)
+
+PHONE_RE = re.compile(r"^\+[1-9]\d{7,14}$")
+SEEN_LEADGEN: set = set()  # Facebook can send the same lead twice
+BACKGROUND_TASKS: set = set()
 
 
-# =========================================================
-# TWILIO CLIENT
-# =========================================================
+def normalize_phone(raw):
+    """Return the number as +<country><digits>, or None if it cannot be trusted."""
+    p = re.sub(r"[\s\-().]", "", str(raw or ""))
+    if p.startswith("00"):
+        p = "+" + p[2:]
+    if not p.startswith("+") and DEFAULT_COUNTRY_CODE:
+        if p.startswith("0"):
+            p = "+" + DEFAULT_COUNTRY_CODE + p.lstrip("0")
+        elif p.startswith(DEFAULT_COUNTRY_CODE):
+            p = "+" + p
+        else:
+            p = "+" + DEFAULT_COUNTRY_CODE + p
+    return p if PHONE_RE.match(p) else None
 
-twilio_client = Client(
-    TWILIO_ACCOUNT_SID,
-    TWILIO_AUTH_TOKEN
-)
 
+def validate_twilio_request(url, params, signature):
+    if not signature:
+        return False
+    try:
+        return validator.validate(url, params, signature)
+    except Exception as e:
+        print(f"Signature validation error: {e}")
+        return False
 
-# =========================================================
-# DEEPGRAM
-# =========================================================
 
 def sts_connect():
-    api_key = os.getenv("DEEPGRAM_API_KEY")
-
-    if not api_key:
-        raise Exception("DEEPGRAM_API_KEY not found")
-
-    sts_ws = websockets.connect(
+    return websockets.connect(
         "wss://agent.deepgram.com/v1/agent/converse",
-        subprotocols=["token", api_key]
+        subprotocols=["token", os.getenv("DEEPGRAM_API_KEY")],
     )
 
-    return sts_ws
 
-
-# =========================================================
-# LOAD DEEPGRAM / GEMINI CONFIG
-# =========================================================
-
-def load_config():
-
+def build_config(lead):
+    """Deepgram Settings message, personalised for this lead."""
     with open("config.json", "r") as f:
         config = json.load(f)
+    with open("solar_agent_config.json", "r") as f:
+        solar = json.load(f)
 
-    google_api_key = os.getenv("GOOGLE_API_KEY")
+    first_name = (lead.get("name") or "there").split()[0]
 
-    if not google_api_key:
-        raise Exception("GOOGLE_API_KEY not found in .env")
+    def fill(text):
+        return (
+            text.replace("{first_name}", first_name)
+            .replace("{company}", COMPANY_NAME)
+            .replace("{agent_name}", AGENT_NAME)
+            .replace("{today}", today_text())
+            .replace("{timezone}", TZ_NAME)
+            # last, so nothing typed into the form can be swapped into the prompt
+            .replace("{form_details}", answers_text(lead.get("answers") or {}) or "none provided")
+        )
 
-    config["agent"]["think"]["endpoint"]["headers"]["authorization"] = (
-        f"Bearer {google_api_key}"
-    )
-
+    agent = config["agent"]
+    agent["greeting"] = fill(solar["greeting"])
+    agent["think"]["prompt"] = fill(solar["prompt"])
+    agent["think"]["functions"] = solar["functions"]
     return config
 
 
 # =========================================================
-# BARGE-IN
+# BARGE-IN + FUNCTION CALLS
 # =========================================================
 
-async def handle_barge_in(
-    decoded,
-    twilio_ws_send,
-    streamsid
-):
-
+async def handle_barge_in(decoded, twilio_ws_send, streamsid):
     if decoded.get("type") == "UserStartedSpeaking":
+        await twilio_ws_send(json.dumps({"event": "clear", "streamSid": streamsid}))
 
-        clear_message = {
-            "event": "clear",
-            "streamSid": streamsid
-        }
-
-        await twilio_ws_send(
-            json.dumps(clear_message)
-        )
-
-
-# =========================================================
-# FUNCTION CALL
-# =========================================================
 
 def execute_function_call(func_name, arguments):
-
-    if func_name in FUNCTION_MAP:
-
-        result = FUNCTION_MAP[func_name](**arguments)
-
-        print(
-            f"Function call result: {result}"
-        )
-
-        return result
-
-    else:
-
-        result = {
-            "error": f"Unknown function: {func_name}"
-        }
-
-        print(result)
-
-        return result
+    func = FUNCTION_MAP.get(func_name)
+    if not func:
+        return {"error": f"Unknown function: {func_name}"}
+    return func(**arguments)
 
 
-def create_function_call_response(
-    func_id,
-    func_name,
-    result
-):
+async def handle_function_call_request(decoded, sts_ws, call_ctx):
+    lead = call_ctx["lead"]
+    for fc in decoded.get("functions", []):
+        if fc.get("client_side") is False:
+            continue
+        func_id = fc.get("id", "unknown")
+        func_name = fc.get("name", "unknown")
+        try:
+            arguments = json.loads(fc.get("arguments") or "{}")
+            # lead id and phone come from our server, never from the model
+            arguments["lead_id"] = lead["id"]
+            arguments["phone"] = lead["phone"]
+            print(f"Function call: {func_name} ({func_id}) lead={lead['id']}")
+            result = await asyncio.to_thread(execute_function_call, func_name, arguments)
+        except Exception as e:
+            print(f"Function {func_name} failed: {e}")
+            result = {"error": "The system could not complete that request."}
 
-    return {
-        "type": "FunctionCallResponse",
-        "id": func_id,
-        "name": func_name,
-        "content": json.dumps(result)
-    }
-
-
-async def handle_function_call_request(
-    decoded,
-    sts_ws
-):
-
-    try:
-
-        for function_call in decoded["functions"]:
-
-            func_name = function_call["name"]
-            func_id = function_call["id"]
-
-            arguments = json.loads(
-                function_call["arguments"]
-            )
-
-            print(
-                f"Function call: {func_name} "
-                f"(ID: {func_id}), "
-                f"arguments: {arguments}"
-            )
-
-            result = execute_function_call(
-                func_name,
-                arguments
-            )
-
-            function_result = create_function_call_response(
-                func_id,
-                func_name,
-                result
-            )
-
-            await sts_ws.send(
-                json.dumps(function_result)
-            )
-
-            print(
-                f"Sent function result: {function_result}"
-            )
-
-    except Exception as e:
-
-        print(
-            f"Error calling function: {e}"
-        )
-
-        error_result = create_function_call_response(
-            func_id if "func_id" in locals() else "unknown",
-            func_name if "func_name" in locals() else "unknown",
-            {
-                "error":
-                f"Function call failed with: {str(e)}"
-            }
-        )
-
-        await sts_ws.send(
-            json.dumps(error_result)
-        )
+        await sts_ws.send(json.dumps({
+            "type": "FunctionCallResponse",
+            "id": func_id,
+            "name": func_name,
+            "content": json.dumps(result),
+        }))
 
 
-async def handle_text_message(
-    decoded,
-    twilio_ws_send,
-    sts_ws,
-    streamsid
-):
-
-    await handle_barge_in(
-        decoded,
-        twilio_ws_send,
-        streamsid
-    )
-
+async def handle_text_message(decoded, twilio_ws_send, sts_ws, streamsid, call_ctx):
+    await handle_barge_in(decoded, twilio_ws_send, streamsid)
     if decoded.get("type") == "FunctionCallRequest":
-
-        await handle_function_call_request(
-            decoded,
-            sts_ws
-        )
+        await handle_function_call_request(decoded, sts_ws, call_ctx)
 
 
 # =========================================================
-# STS SENDER
+# AUDIO BRIDGE
 # =========================================================
 
-async def sts_sender(
-    sts_ws,
-    audio_queue
-):
-
-    print("sts_sender started")
-
+async def sts_sender(sts_ws, audio_queue):
     while True:
-
         chunk = await audio_queue.get()
-
         await sts_ws.send(chunk)
 
 
-# =========================================================
-# STS RECEIVER
-# =========================================================
-
-async def sts_receiver(
-    sts_ws,
-    twilio_ws_send,
-    streamsid_queue
-):
-
-    print("sts_receiver started")
-
-    streamsid = await streamsid_queue.get()
-
+async def sts_receiver(sts_ws, twilio_ws_send, call_ctx):
+    streamsid = call_ctx["stream_sid"]
     async for message in sts_ws:
-
         if isinstance(message, str):
-
-            print(message)
-
             decoded = json.loads(message)
-
-            await handle_text_message(
-                decoded,
-                twilio_ws_send,
-                sts_ws,
-                streamsid
-            )
-
+            msg_type = decoded.get("type")
+            if msg_type in ("Warning", "Error"):
+                print(f"Deepgram {msg_type}: {decoded}")
+            else:
+                print(f"Deepgram: {msg_type}")  # types only: transcripts hold personal data
+            await handle_text_message(decoded, twilio_ws_send, sts_ws, streamsid, call_ctx)
             continue
 
-        raw_mulaw = message
-
-        media_message = {
+        await twilio_ws_send(json.dumps({
             "event": "media",
             "streamSid": streamsid,
-            "media": {
-                "payload":
-                base64.b64encode(raw_mulaw).decode("ascii")
-            }
-        }
-
-        await twilio_ws_send(
-            json.dumps(media_message)
-        )
+            "media": {"payload": base64.b64encode(message).decode("ascii")},
+        }))
 
 
-# =========================================================
-# TWILIO RECEIVER
-# =========================================================
-
-async def twilio_receiver(
-    ws,
-    audio_queue,
-    streamsid_queue
-):
-
+async def twilio_receiver(ws, audio_queue, call_ctx, ready):
     BUFFER_SIZE = 20 * 160
-
-    inbuffer = bytearray(b"")
+    inbuffer = bytearray()
 
     async for msg in ws:
-
         if msg.type != WSMsgType.TEXT:
             continue
-
         try:
-
             data = json.loads(msg.data)
-
-            event = data["event"]
+            event = data.get("event")
 
             if event == "start":
-
-                print("get our streamsid")
-
                 start = data["start"]
-
-                streamsid = start["streamSid"]
-
-                streamsid_queue.put_nowait(
-                    streamsid
-                )
-
-            elif event == "connected":
-
-                continue
+                params = start.get("customParameters", {})
+                call_ctx["lead"] = await asyncio.to_thread(get_lead, params.get("lead_id", ""))
+                call_ctx["stream_sid"] = start["streamSid"]
+                ready.set()
 
             elif event == "media":
-
                 media = data["media"]
-
-                chunk = base64.b64decode(
-                    media["payload"]
-                )
-
-                if media["track"] == "inbound":
-
-                    inbuffer.extend(chunk)
+                if media.get("track") == "inbound":
+                    inbuffer.extend(base64.b64decode(media["payload"]))
+                    while len(inbuffer) >= BUFFER_SIZE:
+                        audio_queue.put_nowait(bytes(inbuffer[:BUFFER_SIZE]))
+                        del inbuffer[:BUFFER_SIZE]
 
             elif event == "stop":
-
                 break
-
-            while len(inbuffer) >= BUFFER_SIZE:
-
-                chunk = inbuffer[:BUFFER_SIZE]
-
-                audio_queue.put_nowait(chunk)
-
-                inbuffer = inbuffer[BUFFER_SIZE:]
-
         except Exception as e:
-
-            print(
-                f"twilio_receiver error: {e}"
-            )
-
+            print(f"twilio_receiver error: {e}")
             break
 
 
-# =========================================================
-# TWILIO WEBSOCKET
-# =========================================================
-
 async def twilio_ws_handler(request):
+    # Reconstruct the exact public WebSocket URL Twilio signed
+    signature = request.headers.get("X-Twilio-Signature", "")
+    base = PUBLIC_BASE_URL + str(request.rel_url)
+    wss = base.replace("https://", "wss://", 1)
+    candidates = [wss, wss + "/", base, base + "/"]
+    matched = next((u for u in candidates if validate_twilio_request(u, {}, signature)), None)
+
+    if not matched:
+        print(f"Rejected unauthorized WebSocket connection (signature present: {bool(signature)})")
+        return web.Response(status=403, text="Forbidden")
 
     ws = web.WebSocketResponse()
-
     await ws.prepare(request)
-
-    print("Twilio WebSocket connected")
+    print("Authenticated Twilio WebSocket connected")
 
     audio_queue = asyncio.Queue()
-
-    streamsid_queue = asyncio.Queue()
+    call_ctx = {}
+    ready = asyncio.Event()
 
     async def twilio_ws_send(text):
-
         await ws.send_str(text)
 
+    # Start reading Twilio first: we need the lead before configuring the agent
+    twilio_task = asyncio.create_task(twilio_receiver(ws, audio_queue, call_ctx, ready))
+    try:
+        await asyncio.wait_for(ready.wait(), timeout=10)
+    except asyncio.TimeoutError:
+        print("No start event from Twilio")
+        twilio_task.cancel()
+        await ws.close()
+        return ws
+
+    if not call_ctx.get("lead"):
+        print("Unknown lead for this stream, closing")
+        twilio_task.cancel()
+        await ws.close()
+        return ws
+
     async with sts_connect() as sts_ws:
+        await sts_ws.send(json.dumps(build_config(call_ctx["lead"])))
 
-        config_message = load_config()
+        tasks = [
+            asyncio.create_task(sts_sender(sts_ws, audio_queue)),
+            asyncio.create_task(sts_receiver(sts_ws, twilio_ws_send, call_ctx)),
+            twilio_task,
+        ]
 
-        await sts_ws.send(
-            json.dumps(config_message)
-        )
+        done, pending = await asyncio.wait(tasks, return_when=asyncio.FIRST_COMPLETED)
+        for t in pending:
+            t.cancel()
+        await asyncio.gather(*pending, return_exceptions=True)
 
-        await asyncio.wait(
-            [
-                asyncio.ensure_future(
-                    sts_sender(
-                        sts_ws,
-                        audio_queue
-                    )
-                ),
-
-                asyncio.ensure_future(
-                    sts_receiver(
-                        sts_ws,
-                        twilio_ws_send,
-                        streamsid_queue
-                    )
-                ),
-
-                asyncio.ensure_future(
-                    twilio_receiver(
-                        ws,
-                        audio_queue,
-                        streamsid_queue
-                    )
-                )
-            ],
-            return_when=asyncio.FIRST_COMPLETED
-        )
+        for t in done:
+            if not t.cancelled() and t.exception():
+                print(f"Task ended with error: {t.exception()}")
 
     print("Twilio WebSocket closed")
-
     return ws
 
 
 # =========================================================
-# TWIML
+# OUTBOUND: /leads places the call, Twilio then asks /twiml-outbound what to do
 # =========================================================
 
-async def twiml_handler(request):
+async def start_call(name, phone, source, answers=None):
+    """Shared by /leads and the Facebook webhook. Returns (http_status, body)."""
+    phone = normalize_phone(phone)
+    if not phone:
+        return 400, {"error": "phone must be in international format, like +923001234567"}
+    if await asyncio.to_thread(is_do_not_call, phone):
+        return 200, {"status": "skipped", "reason": "do_not_call"}
 
-    ws_url = (
-        f"{PUBLIC_BASE_URL.replace('https://', 'wss://').replace('http://', 'ws://')}"
-        f"/media-stream"
+    lead = await asyncio.to_thread(
+        create_lead, str(name or "").strip(), phone, str(source or "unknown"), answers
     )
-
-    xml = f"""<?xml version="1.0" encoding="UTF-8"?>
-<Response>
-    <Connect>
-        <Stream url="{ws_url}" />
-    </Connect>
-</Response>"""
-
-    return web.Response(
-        text=xml,
-        content_type="text/xml"
-    )
-
-
-# =========================================================
-# OUTBOUND CALL
-# =========================================================
-
-def trigger_outbound_call(to_number):
-
-    twiml_url = f"{PUBLIC_BASE_URL}/twiml"
-
-    call = twilio_client.calls.create(
-        from_=TWILIO_FROM_NUMBER,
-        to=to_number,
-        url=twiml_url
-    )
-
-    print(
-        f"Outbound call initiated: "
-        f"{call.sid} -> {to_number}"
-    )
-
-    return call.sid
-
-
-# =========================================================
-# /MAKE-CALL
-# =========================================================
-
-async def make_call_handler(request):
-
-    secret = request.headers.get(
-        "X-API-Secret"
-    )
-
-    if MAKE_CALL_SECRET and secret != MAKE_CALL_SECRET:
-
-        return web.json_response(
-            {"error": "Unauthorized"},
-            status=401
-        )
+    lead_id = lead["id"]
 
     try:
-
-        data = await request.json()
-
-    except Exception:
-
-        return web.json_response(
-            {"error": "Invalid JSON"},
-            status=400
+        call = await asyncio.to_thread(
+            twilio_client.calls.create,
+            to=phone,
+            from_=TWILIO_PHONE_NUMBER,
+            url=f"{PUBLIC_BASE_URL}/twiml-outbound?lead_id={lead_id}",
+            method="POST",
         )
-
-    to_number = data.get("to")
-
-    if not to_number:
-
-        return web.json_response(
-            {"error": "Missing 'to' number"},
-            status=400
-        )
-
-    try:
-
-        call_sid = trigger_outbound_call(
-            to_number
-        )
-
-        return web.json_response(
-            {
-                "status": "initiated",
-                "call_sid": call_sid
-            }
-        )
-
     except Exception as e:
+        await asyncio.to_thread(delete_lead, lead_id)
+        print(f"Twilio call failed: {type(e).__name__}")
+        return 502, {"error": "could not place the call"}
 
-        print(
-            f"make_call error: {e}"
-        )
+    print(f"Calling lead {lead_id} (source: {lead['source']}), call sid {call.sid}")
+    return 200, {"status": "calling", "lead_id": lead_id, "call_sid": call.sid}
 
-        return web.json_response(
-            {
-                "error": str(e)
-            },
-            status=500
-        )
+
+async def leads_handler(request):
+    """POST /leads  {"name": "...", "phone": "+923001234567", "source": "test"}
+    Send the key in the X-API-Key header (or ?key=...). GHL, Zapier or a test
+    script can all use this one entry point."""
+    key = request.headers.get("X-API-Key") or request.query.get("key", "")
+    if not hmac.compare_digest(key.encode(), LEADS_API_KEY.encode()):
+        return web.json_response({"error": "forbidden"}, status=403)
+    try:
+        body = await request.json()
+    except Exception:
+        return web.json_response({"error": "send a JSON body"}, status=400)
+
+    status, result = await start_call(
+        body.get("name"), body.get("phone"), body.get("source"), body.get("answers")
+    )
+    return web.json_response(result, status=status)
 
 
 # =========================================================
-# FACEBOOK WEBHOOK VERIFICATION
+# FACEBOOK LEAD ADS
 # =========================================================
 
 async def fb_webhook_verify(request):
-
-    mode = request.query.get(
-        "hub.mode"
-    )
-
-    token = request.query.get(
-        "hub.verify_token"
-    )
-
-    challenge = request.query.get(
-        "hub.challenge"
-    )
-
-    print(
-        f"Facebook webhook verification: "
-        f"mode={mode}"
-    )
-
     if (
-        mode == "subscribe"
-        and token == FB_VERIFY_TOKEN
+        request.query.get("hub.mode") == "subscribe"
+        and request.query.get("hub.verify_token") == FB_VERIFY_TOKEN
     ):
+        print("Facebook webhook verified")
+        return web.Response(text=request.query.get("hub.challenge", ""))
+    print("Facebook webhook verification failed")
+    return web.Response(status=403)
 
-        print(
-            "FB webhook verified successfully"
-        )
 
-        return web.Response(
-            text=challenge
-        )
+async def process_facebook_lead(leadgen_id):
+    """Fetch the lead from the Graph API, then call it. Runs in the background."""
+    url = f"https://graph.facebook.com/{FB_GRAPH_VERSION}/{leadgen_id}"
+    params = {"access_token": FB_PAGE_ACCESS_TOKEN, "fields": "id,created_time,field_data"}
+    try:
+        timeout = aiohttp.ClientTimeout(total=10)
+        async with aiohttp.ClientSession(timeout=timeout) as session:
+            async with session.get(url, params=params) as resp:
+                lead_data = await resp.json()
+                status = resp.status
+    except Exception as e:
+        print(f"Facebook lead {leadgen_id}: fetch failed ({type(e).__name__})")
+        return
 
-    print(
-        "FB webhook verification failed"
+    if status != 200 or "error" in lead_data:
+        err = lead_data.get("error", {}) if isinstance(lead_data, dict) else {}
+        print(f"Facebook lead {leadgen_id}: Graph API error {status} {err.get('message', '')}")
+        return
+
+    fields = {}
+    for f in lead_data.get("field_data", []):
+        values = f.get("values") or []
+        if values:
+            fields[f.get("name", "")] = values[0]
+
+    phone = fields.get("phone_number") or fields.get("phone")
+    name = (
+        fields.get("full_name")
+        or f"{fields.get('first_name', '')} {fields.get('last_name', '')}".strip()
     )
+    if not phone:
+        print(f"Facebook lead {leadgen_id}: no phone number in the form")
+        return
 
-    return web.Response(
-        status=403
-    )
+    # every other question on the form (property, bill, city...) goes along as answers
+    status, result = await start_call(name, phone, "facebook", fields)
+    print(f"Facebook lead {leadgen_id}: {result.get('status') or result.get('error')}")
 
-
-# =========================================================
-# FACEBOOK LEAD WEBHOOK
-# =========================================================
 
 async def fb_webhook_receive(request):
+    raw = await request.read()
 
-    print(
-        "========== FACEBOOK WEBHOOK =========="
-    )
-
-    try:
-
-        payload = await request.json()
-
-    except Exception as e:
-
-        print(
-            f"Could not parse Facebook JSON: {e}"
-        )
-
-        return web.Response(
-            status=200
-        )
-
-    print(
-        f"FB webhook payload: {payload}"
-    )
-
-    # Check Page Access Token
-    if not FB_PAGE_ACCESS_TOKEN:
-
-        print(
-            "ERROR: FB_PAGE_ACCESS_TOKEN is missing!"
-        )
-
-        return web.Response(
-            status=200
-        )
+    # Only accept posts really signed by Facebook with your app secret
+    signature = request.headers.get("X-Hub-Signature-256", "")
+    expected = "sha256=" + hmac.new(FB_APP_SECRET.encode(), raw, hashlib.sha256).hexdigest()
+    if not hmac.compare_digest(signature.encode(), expected.encode()):
+        print("Rejected Facebook webhook with a bad signature")
+        return web.Response(status=403)
 
     try:
+        payload = json.loads(raw)
+    except Exception:
+        return web.Response(status=200)
 
-        for entry in payload.get(
-            "entry",
-            []
-        ):
+    for entry in payload.get("entry", []):
+        for change in entry.get("changes", []):
+            if change.get("field") != "leadgen":
+                continue
+            leadgen_id = (change.get("value") or {}).get("leadgen_id")
+            if not leadgen_id or leadgen_id in SEEN_LEADGEN:
+                continue
+            if len(SEEN_LEADGEN) > 5000:
+                SEEN_LEADGEN.clear()
+            SEEN_LEADGEN.add(leadgen_id)
+            # Answer Facebook straight away and do the slow work in the background
+            task = asyncio.create_task(process_facebook_lead(str(leadgen_id)))
+            BACKGROUND_TASKS.add(task)
+            task.add_done_callback(BACKGROUND_TASKS.discard)
 
-            for change in entry.get(
-                "changes",
-                []
-            ):
-
-                if change.get("field") != "leadgen":
-
-                    continue
-
-                value = change.get(
-                    "value",
-                    {}
-                )
-
-                leadgen_id = value.get(
-                    "leadgen_id"
-                )
-
-                if not leadgen_id:
-
-                    print(
-                        "ERROR: No leadgen_id received"
-                    )
-
-                    continue
-
-                print(
-                    f"Received leadgen_id: {leadgen_id}"
-                )
-
-                # -----------------------------------------
-                # FETCH LEAD FROM FACEBOOK GRAPH API
-                # -----------------------------------------
-
-                lead_url = (
-                    f"https://graph.facebook.com/v26.0/"
-                    f"{leadgen_id}"
-                )
-
-                params = {
-                    "access_token":
-                    FB_PAGE_ACCESS_TOKEN,
-
-                    "fields":
-                    "id,created_time,field_data"
-                }
-
-                print(
-                    "Requesting lead data from "
-                    "Facebook Graph API..."
-                )
-
-                resp = requests.get(
-                    lead_url,
-                    params=params,
-                    timeout=10
-                )
-
-                print(
-                    f"Facebook Graph API status: "
-                    f"{resp.status_code}"
-                )
-
-                print(
-                    f"Facebook Graph API response: "
-                    f"{resp.text}"
-                )
-
-                try:
-
-                    lead_data = resp.json()
-
-                except Exception:
-
-                    print(
-                        "ERROR: Facebook response "
-                        "was not valid JSON"
-                    )
-
-                    continue
-
-                # -----------------------------------------
-                # GRAPH API ERROR
-                # -----------------------------------------
-
-                if "error" in lead_data:
-
-                    print(
-                        "ERROR fetching lead data:"
-                    )
-
-                    print(
-                        lead_data["error"]
-                    )
-
-                    continue
-
-                # -----------------------------------------
-                # FIND PHONE NUMBER
-                # -----------------------------------------
-
-                phone_number = None
-
-                for field in lead_data.get(
-                    "field_data",
-                    []
-                ):
-
-                    field_name = field.get(
-                        "name"
-                    )
-
-                    field_values = field.get(
-                        "values",
-                        []
-                    )
-
-                    print(
-                        f"Lead field: "
-                        f"{field_name} = {field_values}"
-                    )
-
-                    if (
-                        field_name
-                        in (
-                            "phone_number",
-                            "phone"
-                        )
-                    ):
-
-                        if field_values:
-
-                            phone_number = (
-                                field_values[0]
-                            )
-
-                            break
-
-                # -----------------------------------------
-                # CALL CUSTOMER
-                # -----------------------------------------
-
-                if phone_number:
-
-                    print(
-                        f"Phone number found: "
-                        f"{phone_number}"
-                    )
-
-                    try:
-
-                        trigger_outbound_call(
-                            phone_number
-                        )
-
-                    except Exception as e:
-
-                        print(
-                            f"ERROR initiating "
-                            f"Twilio call: {e}"
-                        )
-
-                else:
-
-                    print(
-                        "No phone number found "
-                        "in lead."
-                    )
-
-                    print(
-                        f"Complete lead data: "
-                        f"{lead_data}"
-                    )
-
-    except Exception as e:
-
-        print(
-            f"fb_webhook_receive error: {e}"
-        )
-
-    # Always acknowledge Facebook
-    return web.Response(
-        status=200
-    )
+    return web.Response(status=200)
 
 
-# =========================================================
-# APP SETUP
-# =========================================================
+async def twiml_outbound(request):
+    """Twilio fetches this once the lead picks up."""
+    data = await request.post()
+    signature_url = PUBLIC_BASE_URL + str(request.rel_url)
+    signature = request.headers.get("X-Twilio-Signature", "")
+    if not validate_twilio_request(signature_url, data, signature):
+        print("Rejected invalid Twilio webhook signature")
+        return web.Response(status=403, text="Forbidden")
+
+    lead_id = request.query.get("lead_id", "")
+    if not await asyncio.to_thread(get_lead, lead_id):
+        return web.Response(status=404, text="Unknown lead")
+
+    ws_url = PUBLIC_BASE_URL.replace("https://", "wss://", 1) + "/media-stream"
+    xml = f"""<?xml version="1.0" encoding="UTF-8"?>
+<Response>
+    <Connect>
+        <Stream url={quoteattr(ws_url)}>
+            <Parameter name="lead_id" value={quoteattr(lead_id)} />
+        </Stream>
+    </Connect>
+</Response>"""
+    return web.Response(text=xml, content_type="text/xml")
+
+
+async def health(request):
+    return web.Response(text="ok")
+
 
 def create_app():
-
     app = web.Application()
-
-    # Twilio
-    app.router.add_get(
-        "/media-stream",
-        twilio_ws_handler
-    )
-
-    app.router.add_post(
-        "/twiml",
-        twiml_handler
-    )
-
-    app.router.add_get(
-        "/twiml",
-        twiml_handler
-    )
-
-    # Manual outbound call
-    app.router.add_post(
-        "/make-call",
-        make_call_handler
-    )
-
-    # Facebook Lead Ads
-    app.router.add_get(
-        "/fb-webhook",
-        fb_webhook_verify
-    )
-
-    app.router.add_post(
-        "/fb-webhook",
-        fb_webhook_receive
-    )
-
+    app.router.add_get("/media-stream", twilio_ws_handler)
+    app.router.add_post("/twiml-outbound", twiml_outbound)
+    app.router.add_post("/leads", leads_handler)
+    app.router.add_get("/health", health)
+    if FB_ENABLED:
+        app.router.add_get("/fb-webhook", fb_webhook_verify)
+        app.router.add_post("/fb-webhook", fb_webhook_receive)
     return app
 
 
-# =========================================================
-# MAIN
-# =========================================================
-
 if __name__ == "__main__":
-
-    if not PUBLIC_BASE_URL:
-
-        raise Exception(
-            "PUBLIC_BASE_URL not set in .env "
-            "(Railway HTTPS URL, no trailing slash)"
-        )
-
-    if not FB_PAGE_ACCESS_TOKEN:
-
-        print(
-            "WARNING: FB_PAGE_ACCESS_TOKEN "
-            "is not set!"
-        )
-
-    app = create_app()
-
-    port = int(
-        os.getenv(
-            "PORT",
-            8080
-        )
-    )
-
-    print(
-        f"Starting server on port {port}. "
-        f"Public URL: {PUBLIC_BASE_URL}"
-    )
-
-    web.run_app(
-        app,
-        host="0.0.0.0",
-        port=port
-    )
+    init_db()  # creates the tables in Supabase on first run
+    port = int(os.getenv("PORT", 8080))
+    if not FB_ENABLED:
+        print("Facebook webhook is OFF (set FB_VERIFY_TOKEN, FB_PAGE_ACCESS_TOKEN and FB_APP_SECRET to turn it on)")
+    print(f"Starting server on port {port}. Public URL: {PUBLIC_BASE_URL}")
+    web.run_app(create_app(), host="0.0.0.0", port=port)
