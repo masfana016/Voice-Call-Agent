@@ -1,19 +1,46 @@
 {
     "type": "Settings",
     "audio": {
-        "input": {"encoding": "mulaw", "sample_rate": 8000},
-        "output": {"encoding": "mulaw", "sample_rate": 8000, "container": "none"}
+        "input": {
+            "encoding": "mulaw",
+            "sample_rate": 8000
+        },
+        "output": {
+            "encoding": "mulaw",
+            "sample_rate": 8000,
+            "container": "none"
+        }
     },
     "agent": {
-        "language": "en",
+        "language": "ur",
         "listen": {
-            "provider": {"type": "deepgram", "model": "nova-3", "language": "en"}
+            "provider": {
+                "type": "deepgram",
+                "model": "nova-3",
+                "language": "ur",
+                "keyterms": [
+                    "سولر",
+                    "سولر پینل",
+                    "انسٹالمنٹ",
+                    "سائٹ سروے",
+                    "بجلی کا بل",
+                    "یونٹ"
+                ]
+            }
         },
         "think": {
-            "provider": {"type": "open_ai", "model": "gpt-4o-mini", "temperature": 0.3}
+            "provider": {
+                "type": "open_ai",
+                "model": "gpt-4o-mini",
+                "temperature": 0.3
+            }
         },
         "speak": {
-            "provider": {"type": "deepgram", "model": "aura-2-thalia-en"}
+            "provider": {
+                "type": "deepgram",
+                "version": "v2",
+                "model": "flux-ambreen-ur"
+            }
         }
     }
 }
