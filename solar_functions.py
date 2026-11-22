@@ -12,7 +12,7 @@ from typing import Optional
 from zoneinfo import ZoneInfo
 
 from dotenv import load_dotenv
-from sqlalchemy import JSON, Column, DateTime, Index, text
+from sqlalchemy import Column, DateTime, Index, text
 from sqlalchemy.exc import IntegrityError
 from sqlmodel import Field, Session, SQLModel, create_engine, select
 
@@ -59,7 +59,6 @@ class Lead(SQLModel, table=True):
     phone: str = Field(index=True)
     source: str = "unknown"
     status: str = "calling"  # calling / qualified / appointment_booked / callback / do_not_call
-    form_answers: dict = Field(default_factory=dict, sa_column=Column(JSON))
     created_at: datetime = Field(default_factory=_now_utc, sa_column=_tz_col())
 
 
@@ -119,9 +118,6 @@ class DoNotCall(SQLModel, table=True):
 
 def init_db() -> None:
     SQLModel.metadata.create_all(engine)
-    # create_all does not change tables that already exist, so add newer columns here
-    with engine.begin() as conn:
-        conn.execute(text("ALTER TABLE leads ADD COLUMN IF NOT EXISTS form_answers JSON"))
 
 
 # =========================================================
@@ -250,60 +246,17 @@ def today_text() -> str:
 
 
 # =========================================================
-# FORM ANSWERS (what the lead typed on the Facebook form)
-# =========================================================
-
-# Contact details are stored on the lead already, so they are not repeated as answers
-_SKIP_FIELDS = {"full_name", "first_name", "last_name", "phone_number", "phone", "email"}
-
-
-def clean_answers(raw) -> dict:
-    """Keep short, single-line text only. Anyone can type anything into a form,
-    so this text is treated as data and never as instructions."""
-    if not isinstance(raw, dict):
-        return {}
-    cleaned = {}
-    for key, value in raw.items():
-        k = str(key).strip().lower()
-        if not k or k in _SKIP_FIELDS:
-            continue
-        k = " ".join(k.replace("_", " ").split())[:60]
-        v = " ".join(str(value).replace("_", " ").split())[:200]
-        if v:
-            cleaned[k] = v
-        if len(cleaned) >= 12:
-            break
-    return cleaned
-
-
-def answers_text(answers: dict) -> str:
-    return "\n".join(f"- {k}: {v}" for k, v in (answers or {}).items())
-
-
-# =========================================================
 # LEAD HELPERS (used by the server)
 # =========================================================
 
 def _lead_dict(lead: Lead) -> dict:
-    return {
-        "id": lead.id,
-        "name": lead.name,
-        "phone": lead.phone,
-        "source": lead.source,
-        "answers": lead.form_answers or {},
-    }
+    return {"id": lead.id, "name": lead.name, "phone": lead.phone, "source": lead.source}
 
 
-def create_lead(name: str, phone: str, source: str, answers: Optional[dict] = None) -> dict:
+def create_lead(name: str, phone: str, source: str) -> dict:
     import uuid
 
-    lead = Lead(
-        id=uuid.uuid4().hex[:12],
-        name=name,
-        phone=phone,
-        source=source,
-        form_answers=clean_answers(answers),
-    )
+    lead = Lead(id=uuid.uuid4().hex[:12], name=name, phone=phone, source=source)
     with Session(engine) as session:
         session.add(lead)
         session.commit()
@@ -361,18 +314,14 @@ def save_qualification(
         if not lead:
             return {"error": "Unknown lead."}
         q = session.get(Qualification, lead_id) or Qualification(lead_id=lead_id)
-        for field, value in (
-            ("owns_property", owns_property),
-            ("monthly_bill", monthly_bill),
-            ("roof_type", roof_type),
-            ("location", location),
-            ("timeline", timeline),
-            ("wants_financing", wants_financing),
-            ("interest_level", interest_level),
-            ("notes", notes),
-        ):
-            if value:  # a correction should not wipe the other saved details
-                setattr(q, field, value)
+        q.owns_property = owns_property
+        q.monthly_bill = monthly_bill
+        q.roof_type = roof_type
+        q.location = location
+        q.timeline = timeline
+        q.wants_financing = wants_financing
+        q.interest_level = interest_level
+        q.notes = notes
         q.updated_at = _now_utc()
         session.add(q)
         if lead.status in ("calling", "qualified"):
@@ -486,16 +435,11 @@ def book_appointment(start: str = "", notes: str = "", lead_id: str = "", phone:
 
         q = session.get(Qualification, lead_id)
         name, lead_phone = lead.name, lead.phone
-        parts = []
-        form_text = answers_text(lead.form_answers or {})
-        if form_text:
-            parts.append("Form answers:\n" + form_text)
-        if q:
-            parts.append(
-                f"Confirmed on the call:\nLocation: {q.location}\nMonthly bill: {q.monthly_bill}\n"
-                f"Roof: {q.roof_type}\nInterest: {q.interest_level}\nNotes: {q.notes}"
-            )
-        summary = "\n\n".join(parts) or "No details saved."
+        summary = (
+            f"Location: {q.location}\nMonthly bill: {q.monthly_bill}\nRoof: {q.roof_type}\n"
+            f"Interest: {q.interest_level}\nNotes: {q.notes}"
+            if q else "No qualification answers saved."
+        )
 
     when = pretty_when(local_start)
     notify(

@@ -19,7 +19,6 @@ load_dotenv()
 from solar_functions import (  # noqa: E402
     FUNCTION_MAP,
     TZ_NAME,
-    answers_text,
     create_lead,
     delete_lead,
     get_lead,
@@ -119,8 +118,6 @@ def build_config(lead):
             .replace("{agent_name}", AGENT_NAME)
             .replace("{today}", today_text())
             .replace("{timezone}", TZ_NAME)
-            # last, so nothing typed into the form can be swapped into the prompt
-            .replace("{form_details}", answers_text(lead.get("answers") or {}) or "none provided")
         )
 
     agent = config["agent"]
@@ -306,7 +303,7 @@ async def twilio_ws_handler(request):
 # OUTBOUND: /leads places the call, Twilio then asks /twiml-outbound what to do
 # =========================================================
 
-async def start_call(name, phone, source, answers=None):
+async def start_call(name, phone, source):
     """Shared by /leads and the Facebook webhook. Returns (http_status, body)."""
     phone = normalize_phone(phone)
     if not phone:
@@ -315,7 +312,7 @@ async def start_call(name, phone, source, answers=None):
         return 200, {"status": "skipped", "reason": "do_not_call"}
 
     lead = await asyncio.to_thread(
-        create_lead, str(name or "").strip(), phone, str(source or "unknown"), answers
+        create_lead, str(name or "").strip(), phone, str(source or "unknown")
     )
     lead_id = lead["id"]
 
@@ -348,9 +345,7 @@ async def leads_handler(request):
     except Exception:
         return web.json_response({"error": "send a JSON body"}, status=400)
 
-    status, result = await start_call(
-        body.get("name"), body.get("phone"), body.get("source"), body.get("answers")
-    )
+    status, result = await start_call(body.get("name"), body.get("phone"), body.get("source"))
     return web.json_response(result, status=status)
 
 
@@ -403,8 +398,7 @@ async def process_facebook_lead(leadgen_id):
         print(f"Facebook lead {leadgen_id}: no phone number in the form")
         return
 
-    # every other question on the form (property, bill, city...) goes along as answers
-    status, result = await start_call(name, phone, "facebook", fields)
+    status, result = await start_call(name, phone, "facebook")
     print(f"Facebook lead {leadgen_id}: {result.get('status') or result.get('error')}")
 
 
